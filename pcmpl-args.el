@@ -3581,6 +3581,279 @@ entered, it will be removed from returned list."
               `((argument 0 (("pw_length" none)))
                 (argument 1 (("num_pw" none)))))))))
 
+(defcustom pcmpl-args-parted-root-command-function
+  'pcmpl-args-parted-root-command-function
+  "Function that executes commands as root.
+It takes a program and arguments, execs them as root and inserts
+results into current buffer."
+  :type '(choice (const :tag "sudo -A" pcmpl-args-parted-root-command-function)
+                 (function :tag "Other"))
+  :group 'pcmpl-args)
+
+(defun pcmpl-args-parted-root-command-function (program &rest args)
+  "Execute PROGRAM with ARGS using \"sudo -A\"."
+  (apply #'pcmpl-args-process-file "sudo" "-A" program args))
+
+(defalias 'pcmpl-args-parted-alignment-type
+  (pcmpl-args-completion-table-with-annotations
+   '(("none" "Use the minimum alignment allowed by the disk type")
+     ("cylinder" "Align partitions to cylinders")
+     ("minimal" "Use minimum alignment as given by the disk  topology  information")
+     ("optimal" "Use optimum alignment as given by the disk  topology  information"))))
+
+(defalias 'pcmpl-args-parted-commands
+  (pcmpl-args-completion-table-with-annotations
+   '(("disk_set" "Changes a flag on the disk")
+     ("help" "Print general help, or help on command")
+     ("align-check" "Check if partition satisfies the alignment constraint")
+     ("mklabel" "Create a new disklabel (partition table)")
+     ("mkpart" "Create a new partition")
+     ("name" "Set the name of partition to name")
+     ("print" "Display the partition table")
+     ("rescue" "Rescue a lost partition")
+     ("resizepart" "Change the end position of partition")
+     ("rm" "Delete partition")
+     ("select" "Choose device as the current device to edit")
+     ("set" "Change the state of the flag on partition")
+     ("unit" "Set unit as the unit to use")
+     ("toggle" "Toggle the state of flag on partition")
+     ("version" "Display version information and a copyright message"))))
+
+(defun pcmpl-args-parted-block-devices ()
+  "Get block devices using parted."
+  (pcmpl-args-cached 'parted-block-devices 60
+    (with-temp-buffer
+      (funcall #'pcmpl-args-parted-root-command-function "parted" "--list" "--machine")
+      (goto-char (point-min))
+      (save-match-data
+        (cl-loop do (forward-line)
+                 for beg = (point)
+                 for end = (1- (search-forward ":"))
+                 collect (buffer-substring beg end)
+                 while (and (search-forward "\n\n") (not (eobp))))))))
+
+(defun pcmpl-args-parted-partitions (device)
+  "Get partitions for DEVICE using parted."
+  (pcmpl-args-cached 'parted-partitions 60
+    (with-temp-buffer
+      (funcall #'pcmpl-args-parted-root-command-function "parted" "--machine" device "print")
+      (goto-char (point-min))
+      (forward-line 2)
+      (save-match-data
+        (cl-loop
+         until (eobp)
+         for params = (split-string (substring (thing-at-point 'line) 0 -2) ":")
+         for (number . rest) = params
+         collect (list number (apply 'format "%s - %s = %s [ %s | %s | %s ]" rest))
+         do (forward-line))))))
+
+(defun pcmpl-args-parted-partitions-completion-table (device)
+  "Completion table with partitions for DEVICE."
+  (pcmpl-args-completion-table-with-annotations
+   (pcmpl-args-parted-partitions device)))
+
+(defun pcmpl-args-parted-partition-table (device)
+  "Get partition table for DEVICE."
+  (pcmpl-args-cached 'parted-partition-table 60
+    (with-temp-buffer
+      (funcall #'pcmpl-args-parted-root-command-function "parted" "--machine" device "print")
+      (goto-char (point-min))
+      (forward-line)
+      (let ((beg (search-forward ":" nil nil 5))
+            (end (1- (search-forward ":"))))
+        (buffer-substring beg end)))))
+
+(defun pcmpl-args-parted-disk-flags (device)
+  "Get disk flags for DEVICE."
+  (pcmpl-args-cached 'parted-disk-flags 60
+    (with-temp-buffer
+      (funcall #'pcmpl-args-parted-root-command-function "parted" "--machine" device "print")
+      (goto-char (point-min))
+      (forward-line)
+      (let ((beg (search-forward ":" nil nil 7))
+            (end (1- (search-forward ";"))))
+        (if (/= beg end)
+            (split-string (buffer-substring beg end) "," nil " ")
+          (ignore (message "No disk flags!")))))))
+
+(defvar pcmpl-args-parted-flags
+  (cl-loop with flags = '(("bios_grub" . "selected partition is a GRUB BIOS partition")
+                          ("legacy_boot" . "tell special purpose software that the partition may be bootable")
+                          ("boot" . "enable to boot off the partition")
+                          ("msftdata" . "partition contain Microsoft filesystems (NTFS or FAT)")
+                          ("msftres" . "Microsoft Reserved partition, which is used by Windows (NTFS or FAT)")
+                          ("irst" . "Intel Rapid Start Technology partition")
+                          ("esp" . "UEFI System Partition. On GPT it is an alias for boot")
+                          ("lba" . "use Linear (LBA) mode")
+                          ("root" . "partition is the root device to be used by Linux")
+                          ("swap" . "partition is the swap device to be used by Linux")
+                          ("hidden" . "hide partitions from Microsoft operating systems")
+                          ("raid" . "tell linux the partition is a software RAID partition")
+                          ("lvm" . "tell linux the partition is a physical volume")
+                          ("palo" . "partition can be used by the Linux/PA-RISC boot loader, palo")
+                          ("prep" . "partition can be used as a PReP boot partition on PowerPC PReP or IBM RS6K/CHRP hardware")
+                          ("diag" . "partition can be used as a diagnostics / recovery partition"))
+           with result = (make-hash-table :test 'equal :size (length flags))
+           for (key . value) in flags
+           do (puthash key value result)
+           finally return result))
+
+(defun pcmpl-args-parted-flags (device)
+  "Get flags for partition table of DEVICE."
+  (pcmpl-args-completion-table-with-annotations
+   (mapcar
+    (lambda (flag)
+      (list flag (gethash flag pcmpl-args-parted-flags)))
+    (pcase (pcmpl-args-parted-partition-table device)
+      ("gpt"
+       '("bios_grub" "legacy_boot" "msftdata" "msftres" "irst" "esp" "prep"))
+      ("msdos"
+       '("boot" "msftres" "irst" "esp" "lba" "raid" "lvm" "palo" "prep" "diag" "hidden"))
+      ("mac"
+       '("boot" "root" "swap"))
+      ("pc98"
+       '("boot" "hidden"))))))
+
+(defalias 'pcmpl-args-parted-units
+  (pcmpl-args-completion-table-with-annotations
+   '(("s" "sector (n bytes depending on the sector size, often 512)")
+     ("B" "byte")
+     ("KiB" "kibibyte (1024 bytes)")
+     ("MiB" "mebibyte (1048576 bytes)")
+     ("GiB" "gibibyte (1073741824 bytes)")
+     ("TiB" "tebibyte (1099511627776 bytes)")
+     ("kB" "kilobyte (1000 bytes)")
+     ("MB" "megabyte (1000000 bytes)")
+     ("GB" "gigabyte (1000000000 bytes)")
+     ("TB" "terabyte (1000000000000 bytes)")
+     ("%" "percentage of the device (between 0 and 100)")
+     ("cyl" "cylinders (related to the BIOS CHS geometry)")
+     ("chs" "cylinders, heads, sectors addressing (related to the BIOS CHS geometry)")
+     ("compact" "megabytes for input, compact human readable for output"))))
+
+(defun pcmpl-args-parted-command-specs (command device)
+  "Specs for parted completion.
+It can accept parted COMMAND and DEVICE."
+  (let ((cmd-specs
+         (pcase command
+           ("disk_set"
+            `((argument 0 (("DISK_FLAG" (:eval (pcmpl-args-parted-disk-flags ,device)))))
+              (argument 1 (("STATE" (:eval (list "on" "off")))))))
+
+           ("help"
+            '((argument 0 (("PARTED_COMMAND" pcmpl-args-parted-commands)))))
+
+           ("align-check"
+            `((argument 0 (("TYPE" (:eval (list "minimal" "optimal")))))
+              (argument 1 (("PARTITION" (:eval (pcmpl-args-parted-partitions-completion-table ,device)))))))
+
+           ("mklabel"
+            '((argument 0 (("LABEL_TYPE" (:eval (list "aix" "amiga" "bsd" "dvh" "gpt"
+                                                      "loop" "mac" "msdos" "pc98"
+                                                      "sun")))))))
+
+           ("mkpart"
+            (let ((fs-types '(list "btrfs" "ext2" "ext3" "ext4" "fat16" "fat32" "hfs"
+                                   "hfs+" "linux-swap" "ntfs" "reiserfs" "udf" "xfs")))
+              (pcase (pcmpl-args-parted-partition-table device)
+                ((or "msdos" "dvh")
+                 `((argument 0 (("PART_TYPE" (:eval (list "primary" "logical" "extended")))))
+                   (argument 1 (("NAME" none)))
+                   (argument 2 (("FS_TYPE" (:eval ,fs-types))))
+                   (argument 3 (("START" none)))
+                   (argument 4 (("END" none)))))
+                ("sun"
+                 `((argument 0 (("FS_TYPE" (:eval ,fs-types))))
+                   (argument 1 (("START" none)))
+                   (argument 2 (("END" none)))))
+                (_
+                 `((argument 0 (("NAME" none)))
+                   (argument 1 (("FS_TYPE" (:eval ,fs-types))))
+                   (argument 2 (("START" none)))
+                   (argument 3 (("END" none))))))))
+
+           ("name"
+            (pcase (pcmpl-args-parted-partition-table device)
+              ((or "gpt" "mac" "pc98")
+               `((argument 0 (("PARTITION" (:eval (pcmpl-args-parted-partitions-completion-table ,device)))))
+                 (argument 1 (("NAME" none)))))))
+
+           ("print"
+            (let ((completion-table
+                   (pcmpl-args-completion-table-with-annotations
+                    `(("devices"   "all active block devices")
+                      ("free"      "free unpartitioned space")
+                      ("list" "partition tables of all active block devices")
+                      ("all" "partition tables of all active block devices")
+                      . ,(pcmpl-args-parted-partitions device)))))
+              `((argument 0 (("PRINTOPTS" (:eval ,completion-table)))))))
+
+           ("rescue"
+            '((argument 0 (("START" none)))
+              (argument 1 (("END" none)))))
+
+           ("resizepart"
+            `((argument 0 (("PARTITION" (:eval (pcmpl-args-parted-partitions-completion-table ,device)))))
+              (argument 1 (("END" none)))))
+
+           ("rm"
+            `((argument 0 (("PARTITION" (:eval (pcmpl-args-parted-partitions-completion-table ,device)))))))
+
+           ("select"
+            '((argument 0 (("DEVICE" (:eval (pcmpl-args-parted-block-devices)))))))
+
+           ("set"
+            `((argument 0 (("PARTITION" (:eval (pcmpl-args-parted-partitions-completion-table ,device)))))
+              (argument 1 (("FLAG" (:eval (pcmpl-args-parted-flags ,device)))))
+              (argument 2 (("STATE" (:eval (list "on" "off")))))))
+
+           ("unit"
+            '((argument 0 (("UNIT" pcmpl-args-parted-units)))))
+
+           ("toggle"
+            `((argument 0 (("PARTITION" (:eval (pcmpl-args-parted-partitions-completion-table ,device)))))
+              (argument 1 (("FLAG" (:eval (pcmpl-args-parted-flags ,device))))))))))
+    (append
+     cmd-specs
+     '((argument 10 (("COMMAND" nil)) :subparser pcmpl-args-parted-subparser)))))
+
+(defun pcmpl-args-parted-subparser (arguments argspecs seen)
+  "Parted subparser.
+For ARGUMENTS, ARGSPECS and SEEN see pcmpl-args documentation."
+  (let ((command (pop arguments)))
+    (push (list :name 'command
+                :stub command
+                :values (list command)
+                :action '("COMMAND" pcmpl-args-parted-commands))
+          seen)
+
+    (when arguments
+      (let* ((by-name (lambda (a) (plist-get a :name)))
+             (device
+              (thread-first 0
+                (cl-find seen :test #'equal :key by-name :from-end t)
+                (plist-get :values)
+                car)))
+        (setq argspecs
+              (pcmpl-args-make-argspecs
+               (pcmpl-args-parted-command-specs command device))))))
+  (list arguments argspecs seen))
+
+(defun pcomplete/parted ()
+  "Pcomplete completion for parted."
+  (pcmpl-args-pcomplete
+   (pcmpl-args-make-argspecs
+    '((option "-h, --help" :help "displays a help message")
+      (option "-l, --list" :help "lists partition layout on all block devices")
+      (option "-m, --machine" :help "displays machine parseable output")
+      (option "-s, --script" :help "never prompts for user intervention")
+      (option "-v, --version" :help "displays the version")
+      (option "-a ALIGNMENT_TYPE, --align ALIGNMENT_TYPE"
+              (("ALIGNMENT_TYPE" pcmpl-args-parted-alignment-type))
+              :help "Set alignment for newly created partitions")
+      (argument 0 (("DEVICE" (:eval (pcmpl-args-parted-block-devices)))))
+      (argument 1 (("COMMAND" nil)) :subparser pcmpl-args-parted-subparser)))))
+
 
 ;;; Testing
 
@@ -3865,7 +4138,7 @@ will print completions for `ls -'."
 ;;   (insert (format "\n\n;;;###autoload (dolist (func '(%s)) (autoload func \"pcmpl-args\"))\n"
 ;;                   (mapconcat 'identity accum " "))))
 
-;;;###autoload (dolist (func '(pcomplete/chgrp pcomplete/chmod pcomplete/chown pcomplete/chroot pcomplete/cp pcomplete/date pcomplete/dd pcomplete/dir pcomplete/echo pcomplete/env pcomplete/false pcomplete/groups pcomplete/id pcomplete/ln pcomplete/ls pcomplete/mv pcomplete/nice pcomplete/nohup pcomplete/printenv pcomplete/printf pcomplete/rm pcomplete/rmdir pcomplete/sort pcomplete/stat pcomplete/test pcomplete/true pcomplete/vdir pcomplete/basename pcomplete/cat pcomplete/cksum pcomplete/comm pcomplete/csplit pcomplete/cut pcomplete/df pcomplete/dircolors pcomplete/dirname pcomplete/du pcomplete/expand pcomplete/expr pcomplete/factor pcomplete/fmt pcomplete/fold pcomplete/head pcomplete/hostid pcomplete/install pcomplete/join pcomplete/link pcomplete/logname pcomplete/md5sum pcomplete/mkdir pcomplete/mkfifo pcomplete/mknod pcomplete/mktemp pcomplete/nl pcomplete/od pcomplete/paste pcomplete/pathchk pcomplete/pinky pcomplete/pr pcomplete/ptx pcomplete/pwd pcomplete/readlink pcomplete/seq pcomplete/sha1sum pcomplete/shred pcomplete/sleep pcomplete/split pcomplete/stty pcomplete/sum pcomplete/sync pcomplete/tac pcomplete/tail pcomplete/tee pcomplete/touch pcomplete/tr pcomplete/tsort pcomplete/tty pcomplete/uname pcomplete/unexpand pcomplete/uniq pcomplete/unlink pcomplete/users pcomplete/wc pcomplete/whoami pcomplete/who pcomplete/yes pcomplete/man pcomplete/info pcomplete/find pcomplete/command pcomplete/time pcomplete/which pcomplete/coproc pcomplete/do pcomplete/elif pcomplete/else pcomplete/exec pcomplete/if pcomplete/then pcomplete/until pcomplete/whatis pcomplete/whence pcomplete/where pcomplete/whereis pcomplete/while pcomplete/gzip pcomplete/bzip2 pcomplete/xz pcomplete/tar pcomplete/perl pcomplete/python pcomplete/bzr pcomplete/hg pcomplete/git pcomplete/etags pcomplete/ctags pcomplete/ctags-exuberant pcomplete/cmp pcomplete/curl pcomplete/dict pcomplete/enscript pcomplete/gcc pcomplete/gdb pcomplete/gprof pcomplete/grep pcomplete/egrep pcomplete/fgrep pcomplete/rgrep pcomplete/make pcomplete/rsync pcomplete/sudo pcomplete/vlc pcomplete/xargs pcomplete/configure pcomplete/nosetests pcomplete/a2ps pcomplete/ack-grep pcomplete/agrep pcomplete/automake pcomplete/awk pcomplete/bash pcomplete/bc pcomplete/bison pcomplete/cal pcomplete/dc pcomplete/diff pcomplete/emacs pcomplete/gawk pcomplete/gperf pcomplete/indent pcomplete/locate pcomplete/ld pcomplete/ldd pcomplete/m4 pcomplete/ncal pcomplete/netstat pcomplete/nm pcomplete/objcopy pcomplete/objdump pcomplete/patch pcomplete/pgrep pcomplete/ps pcomplete/readelf pcomplete/sed pcomplete/shar pcomplete/strip pcomplete/texindex pcomplete/traceroute pcomplete/wget pcomplete/pass pcomplete/pwgen)) (autoload func "pcmpl-args"))
+;;;###autoload (dolist (func '(pcomplete/chgrp pcomplete/chmod pcomplete/chown pcomplete/chroot pcomplete/cp pcomplete/date pcomplete/dd pcomplete/dir pcomplete/echo pcomplete/env pcomplete/false pcomplete/groups pcomplete/id pcomplete/ln pcomplete/ls pcomplete/mv pcomplete/nice pcomplete/nohup pcomplete/printenv pcomplete/printf pcomplete/rm pcomplete/rmdir pcomplete/sort pcomplete/stat pcomplete/test pcomplete/true pcomplete/vdir pcomplete/basename pcomplete/cat pcomplete/cksum pcomplete/comm pcomplete/csplit pcomplete/cut pcomplete/df pcomplete/dircolors pcomplete/dirname pcomplete/du pcomplete/expand pcomplete/expr pcomplete/factor pcomplete/fmt pcomplete/fold pcomplete/head pcomplete/hostid pcomplete/install pcomplete/join pcomplete/link pcomplete/logname pcomplete/md5sum pcomplete/mkdir pcomplete/mkfifo pcomplete/mknod pcomplete/mktemp pcomplete/nl pcomplete/od pcomplete/paste pcomplete/pathchk pcomplete/pinky pcomplete/pr pcomplete/ptx pcomplete/pwd pcomplete/readlink pcomplete/seq pcomplete/sha1sum pcomplete/shred pcomplete/sleep pcomplete/split pcomplete/stty pcomplete/sum pcomplete/sync pcomplete/tac pcomplete/tail pcomplete/tee pcomplete/touch pcomplete/tr pcomplete/tsort pcomplete/tty pcomplete/uname pcomplete/unexpand pcomplete/uniq pcomplete/unlink pcomplete/users pcomplete/wc pcomplete/whoami pcomplete/who pcomplete/yes pcomplete/man pcomplete/info pcomplete/find pcomplete/command pcomplete/time pcomplete/which pcomplete/coproc pcomplete/do pcomplete/elif pcomplete/else pcomplete/exec pcomplete/if pcomplete/then pcomplete/until pcomplete/whatis pcomplete/whence pcomplete/where pcomplete/whereis pcomplete/while pcomplete/gzip pcomplete/bzip2 pcomplete/xz pcomplete/tar pcomplete/perl pcomplete/python pcomplete/bzr pcomplete/hg pcomplete/git pcomplete/etags pcomplete/ctags pcomplete/ctags-exuberant pcomplete/cmp pcomplete/curl pcomplete/dict pcomplete/enscript pcomplete/gcc pcomplete/gdb pcomplete/gprof pcomplete/grep pcomplete/egrep pcomplete/fgrep pcomplete/rgrep pcomplete/make pcomplete/rsync pcomplete/sudo pcomplete/vlc pcomplete/xargs pcomplete/configure pcomplete/nosetests pcomplete/a2ps pcomplete/ack-grep pcomplete/agrep pcomplete/automake pcomplete/awk pcomplete/bash pcomplete/bc pcomplete/bison pcomplete/cal pcomplete/dc pcomplete/diff pcomplete/emacs pcomplete/gawk pcomplete/gperf pcomplete/indent pcomplete/locate pcomplete/ld pcomplete/ldd pcomplete/m4 pcomplete/ncal pcomplete/netstat pcomplete/nm pcomplete/objcopy pcomplete/objdump pcomplete/patch pcomplete/pgrep pcomplete/ps pcomplete/readelf pcomplete/sed pcomplete/shar pcomplete/strip pcomplete/texindex pcomplete/traceroute pcomplete/wget pcomplete/pass pcomplete/pwgen pcomplete/parted)) (autoload func "pcmpl-args"))
 
 (provide 'pcmpl-args)
 ;;; pcmpl-args.el ends here
